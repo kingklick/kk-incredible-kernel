@@ -68,12 +68,12 @@ struct battery_status {
 #define CHARGE_FAST	2
 #define CHARGE_BATT_DISABLE	3 /* disable charging at battery */
 
-#define TEMP_CRITICAL	700 /* no charging at all */ // 600
-#define TEMP_HOT	600 /* no fast charge, no charge > 4.1v */ // 500
-#define TEMP_WARM	550 /* no fast charge above this */ // 450 
+#define TEMP_CRITICAL	800 /* no charging at all */ // 600
+#define TEMP_HOT	700 /* no fast charge, no charge > 4.1v */ // 500
+#define TEMP_WARM	650 /* no fast charge above this */ // 450 
 
-#define TEMP_HOT_MAX_MV	4300 /* stop charging here when hot */ // 4100
-#define TEMP_HOT_MIN_MV	3500 /* resume charging here when hot */ // 3800
+#define TEMP_HOT_MAX_MV	4500 /* stop charging here when hot */ // 4100
+#define TEMP_HOT_MIN_MV	4200 /* resume charging here when hot */ // 3800
 #define CE_DISABLE_MIN_MV 4100
 
 #define BATTERY_LOG_MAX 1024
