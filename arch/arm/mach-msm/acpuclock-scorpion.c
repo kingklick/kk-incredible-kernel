@@ -164,6 +164,7 @@ struct clock_state {
 	unsigned long			power_collapse_khz;
 	unsigned long			wait_for_irq_khz;
 	struct clk*			clk_ebi1;
+	struct regulator    *regulator;
 	int (*acpu_set_vdd) (int mvolts);
 };
 
