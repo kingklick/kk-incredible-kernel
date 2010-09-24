@@ -288,6 +288,23 @@ static void select_clock(unsigned src, unsigned config)
 	writel(val | ((src & 3) << 1), SPSS_CLK_SEL_ADDR);
 }
 
+static int acpu_set_vdd(int vdd)
+{
+	if (!drv_state.regulator || IS_ERR(drv_state.regulator)) {
+		drv_state.regulator = regulator_get(NULL, "acpu_vcore");
+		if (IS_ERR(drv_state.regulator)) {
+			pr_info("acpuclk_set_vdd_level %d no regulator\n", vdd);
+			/* Assume that the PMIC supports scaling the processor
+			 * to its maximum frequency at its default voltage.
+			 */
+			return -ENODEV;
+		}
+		pr_info("acpuclk_set_vdd_level got regulator\n");
+	}
+	vdd *= 1000; /* mV -> uV */
+	return regulator_set_voltage(drv_state.regulator, vdd, vdd);
+}
+
 static int acpuclk_set_vdd_level(int vdd)
 {
 	if (drv_state.acpu_set_vdd)
