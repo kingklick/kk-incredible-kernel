@@ -111,12 +111,16 @@
  * approximate multiples of ten for less overhead.
  */
 #define JIFFIES_TO_NS(TIME)	((TIME) * (1000000000 / HZ))
+#define JIFFY_NS		(1000000000 / HZ)
 #define HALF_JIFFY_NS		(1000000000 / HZ / 2)
 #define HALF_JIFFY_US		(1000000 / HZ / 2)
 #define MS_TO_NS(TIME)		((TIME) << 20)
 #define MS_TO_US(TIME)		((TIME) << 10)
+#define US_TO_NS(TIME)		((TIME) >> 10)
 #define NS_TO_MS(TIME)		((TIME) >> 20)
 #define NS_TO_US(TIME)		((TIME) >> 10)
+
+#define RESCHED_US	(100) /* Reschedule if less than this many us left */
 
 /*
  * This is the time all tasks within the same priority round robin.
@@ -163,8 +167,8 @@ struct global_rq {
 	cpumask_t cpu_idle_map;
 	int idle_cpus;
 #endif
-	/* Nanosecond jiffies */
-	u64 niffies;
+	u64 niffies; /* Nanosecond jiffies */
+	unsigned long last_jiffy; /* Last jiffy we updated niffies */
 
 	spinlock_t iso_lock;
 	int iso_ticks;
@@ -190,7 +194,7 @@ struct rq {
 	struct mm_struct *prev_mm;
 
 	/* Stored data about rq->curr to work outside grq lock */
-	unsigned long rq_deadline;
+	u64 rq_deadline;
 	unsigned int rq_policy;
 	int rq_time_slice;
 	u64 rq_last_ran;
@@ -302,6 +306,23 @@ static struct root_domain def_root_domain;
 
 static inline void update_rq_clock(struct rq *rq);
 
+/*
+ * Sanity check should sched_clock return bogus values. We make sure it does
+ * not appear to go backwards, and use jiffies to determine the maximum it
+ * could possibly have increased. At least 1us will have always passed so we
+ * use that when we don't trust the difference.
+ */
+static inline void niffy_diff(s64 *niff_diff, int jiff_diff)
+{
+	unsigned long max_diff;
+
+	/*  Round up to the nearest tick for maximum */
+	max_diff = JIFFIES_TO_NS(jiff_diff + 1);
+
+	if (unlikely(*niff_diff < 1 || *niff_diff > max_diff))
+		*niff_diff = US_TO_NS(1);
+}
+
 #ifdef CONFIG_SMP
 #define cpu_rq(cpu)		(&per_cpu(runqueues, (cpu)))
 #define this_rq()		(&__get_cpu_var(runqueues))
@@ -313,7 +334,7 @@ static inline int cpu_of(struct rq *rq)
 }
 
 /*
- * Miffies are a globally increasing nanosecond counter. Whenever a runqueue
+ * Niffies are a globally increasing nanosecond counter. Whenever a runqueue
  * clock is updated with the grq.lock held, it is an opportunity to update the
  * niffies value. Any CPU can update it by adding how much its clock has
  * increased since it last updated niffies, minus any added niffies by other
@@ -322,18 +343,16 @@ static inline int cpu_of(struct rq *rq)
 static inline void update_clocks(struct rq *rq)
 {
 	s64 ndiff;
+	long jdiff;
 
 	update_rq_clock(rq);
 	ndiff = rq->clock - rq->old_clock;
 	/* old_clock is only updated when we are updating niffies */
 	rq->old_clock = rq->clock;
 	ndiff -= grq.niffies - rq->last_niffy;
-	/*
-	 * Sanity check should sched_clock return bogus values or be limited to
-	 * just jiffy resolution. Some time will always have passed.
-	 */
-	if (unlikely(ndiff < 1 || ndiff > MS_TO_NS(rr_interval)))
-		ndiff = 1;
+	jdiff = jiffies - grq.last_jiffy;
+	niffy_diff(&ndiff, jdiff);
+	grq.last_jiffy += jdiff;
 	grq.niffies += ndiff;
 	rq->last_niffy = grq.niffies;
 }
@@ -351,12 +370,14 @@ static inline int cpu_of(struct rq *rq)
 static inline void update_clocks(struct rq *rq)
 {
 	s64 ndiff;
+	long jdiff;
 
 	update_rq_clock(rq);
 	ndiff = rq->clock - rq->old_clock;
 	rq->old_clock = rq->clock;
-	if (unlikely(ndiff < 1 || ndiff > MS_TO_US(rr_interval)))
-		ndiff = 1;
+	jdiff = jiffies - grq.last_jiffy;
+	niffy_diff(&ndiff, jdiff);
+	grq.last_jiffy += jdiff;
 	grq.niffies += ndiff;
 }
 #endif
@@ -582,17 +603,6 @@ static void dequeue_task(struct task_struct *p)
 	list_del_init(&p->run_list);
 	if (list_empty(grq.queue + p->prio))
 		__clear_bit(p->prio, grq.prio_bitmap);
-}
-
-/*
- * When a task is freshly forked, the first_time_slice flag is set to say
- * it has taken time_slice from its parent and if it exits on this first
- * time_slice it can return its time_slice back to the parent.
- */
-static inline void reset_first_time_slice(struct task_struct *p)
-{
-	if (unlikely(p->first_time_slice))
-		p->first_time_slice = 0;
 }
 
 /*
@@ -1279,7 +1289,7 @@ EXPORT_SYMBOL(kthread_bind);
  * prio PRIO_LIMIT so it is always preempted.
  */
 static inline int
-can_preempt(struct task_struct *p, int prio, unsigned long deadline,
+can_preempt(struct task_struct *p, int prio, u64 deadline,
 	    unsigned int policy)
 {
 	/* Better static priority RT task or better policy preemption */
@@ -1330,7 +1340,8 @@ static inline int needs_other_cpu(struct task_struct *p, int cpu)
 static void try_preempt(struct task_struct *p, struct rq *this_rq)
 {
 	struct rq *highest_prio_rq = this_rq;
-	unsigned long latest_deadline, cpu;
+	u64 latest_deadline;
+	unsigned long cpu;
 	int highest_prio;
 	cpumask_t tmp;
 
@@ -1352,7 +1363,7 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 	highest_prio = -1;
 
 	for_each_cpu_mask(cpu, tmp) {
-		unsigned long offset_deadline;
+		u64 offset_deadline;
 		struct rq *rq;
 		int rq_prio;
 
@@ -1364,9 +1375,8 @@ static void try_preempt(struct task_struct *p, struct rq *this_rq)
 		offset_deadline = rq->rq_deadline -
 				  cache_distance(this_rq, rq, p);
 
-		if (rq_prio > highest_prio ||
-		    (deadline_after(offset_deadline, latest_deadline) ||
-		    (offset_deadline == latest_deadline && this_rq == rq))) {
+		if (rq_prio > highest_prio || (rq_prio == highest_prio &&
+		    deadline_after(offset_deadline, latest_deadline))) {
 			latest_deadline = offset_deadline;
 			highest_prio = rq_prio;
 			highest_prio_rq = rq;
@@ -1500,12 +1510,15 @@ int wake_up_state(struct task_struct *p, unsigned int state)
 	return try_to_wake_up(p, state, 0);
 }
 
+static void time_slice_expired(struct task_struct *p);
+
 /*
  * Perform scheduler related setup for a newly forked process p.
  * p is forked by current.
  */
 void sched_fork(struct task_struct *p, int clone_flags)
 {
+	struct task_struct *curr;
 	int cpu = get_cpu();
 	struct rq *rq;
 
@@ -1545,10 +1558,11 @@ void sched_fork(struct task_struct *p, int clone_flags)
 		p->sched_reset_on_fork = 0;
 	}
 
+	curr = current;
 	/*
 	 * Make sure we do not leak PI boosting priority to the child.
 	 */
-	p->prio = current->normal_prio;
+	p->prio = curr->normal_prio;
 
 	INIT_LIST_HEAD(&p->run_list);
 #if defined(CONFIG_SCHEDSTATS) || defined(CONFIG_TASK_DELAY_ACCT)
@@ -1569,18 +1583,26 @@ void sched_fork(struct task_struct *p, int clone_flags)
 	 * total amount of pending timeslices in the system doesn't change,
 	 * resulting in more scheduling fairness. If it's negative, it won't
 	 * matter since that's the same as being 0. current's time_slice is
-	 * actually in rq_time_slice when it's running.
+	 * actually in rq_time_slice when it's running, as is its last_ran
+	 * value. rq->rq_deadline is only modified within schedule() so it
+	 * is always equal to current->deadline.
 	 */
-	rq = task_grq_lock_irq(current);
-	if (likely(rq->rq_time_slice > 0)) {
+	rq = task_grq_lock_irq(curr);
+	if (likely(rq->rq_time_slice >= RESCHED_US * 2)) {
 		rq->rq_time_slice /= 2;
+		p->time_slice = rq->rq_time_slice;
+	} else {
 		/*
-		 * The remainder of the first timeslice might be recovered by
-		 * the parent if the child exits early enough.
+		 * Forking task has run out of timeslice. Reschedule it and
+		 * start its child with a new time slice and deadline. The
+		 * child will end up running first because its deadline will
+		 * be slightly earlier.
 		 */
-		p->first_time_slice = 1;
+		rq->rq_time_slice = 0;
+		set_tsk_need_resched(curr);
+		time_slice_expired(p);
 	}
-	p->time_slice = rq->rq_time_slice;
+	p->last_ran = rq->rq_last_ran;
 	task_grq_unlock_irq();
 out:
 	put_cpu();
@@ -1619,40 +1641,9 @@ void wake_up_new_task(struct task_struct *p, unsigned long clone_flags)
 	task_grq_unlock(&flags);
 }
 
-/*
- * Potentially available exiting-child timeslices are
- * retrieved here - this way the parent does not get
- * penalised for creating too many threads.
- *
- * (this cannot be used to 'generate' timeslices
- * artificially, because any timeslice recovered here
- * was given away by the parent in the first place.)
- */
+/* Nothing to do here */
 void sched_exit(struct task_struct *p)
 {
-	struct task_struct *parent;
-	unsigned long flags;
-	struct rq *rq;
-
-	if (unlikely(p->first_time_slice)) {
-		int *par_tslice, *p_tslice;
-
-		parent = p->parent;
-		par_tslice = &parent->time_slice;
-		p_tslice = &p->time_slice;
-
-		rq = task_grq_lock(parent, &flags);
-		/* The real time_slice of the "curr" task is on the rq var.*/
-		if (p == rq->curr)
-			p_tslice = &rq->rq_time_slice;
-		else if (parent == task_rq(parent)->curr)
-			par_tslice = &rq->rq_time_slice;
-
-		*par_tslice += *p_tslice;
-		if (unlikely(*par_tslice > timeslice()))
-			*par_tslice = timeslice();
-		task_grq_unlock(&flags);
-	}
 }
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -2068,16 +2059,12 @@ static void pc_user_time(struct rq *rq, struct task_struct *p,
 }
 
 /* Convert nanoseconds to percentage of one tick. */
-#define NS_TO_PC(NS)	(NS * 100 / JIFFIES_TO_NS(1))
+#define NS_TO_PC(NS)	(NS * 100 / JIFFY_NS)
 
 /*
  * This is called on clock ticks and on context switches.
  * Bank in p->sched_time the ns elapsed since the last tick or switch.
  * CPU scheduler quota accounting is also performed here in microseconds.
- * The value returned from sched_clock() occasionally gives bogus values so
- * some sanity checking is required. Time is supposed to be banked all the
- * time so default to half a tick to make up for when sched_clock reverts
- * to just returning jiffies, and for hardware that can't do tsc.
  */
 static void
 update_cpu_clock(struct rq *rq, struct task_struct *p, int tick)
@@ -2112,18 +2099,9 @@ update_cpu_clock(struct rq *rq, struct task_struct *p, int tick)
 
 	/* time_slice accounting is done in usecs to avoid overflow on 32bit */
 	if (rq->rq_policy != SCHED_FIFO && p != idle) {
-		long time_diff = rq->clock - rq->rq_last_ran;
+		s64 time_diff = rq->clock - rq->rq_last_ran;
 
-		/*
-		 * There should be less than or equal to one jiffy worth, and not
-		 * negative/overflow. time_diff is only used for internal scheduler
-		 * time_slice accounting.
-		 */
-		if (unlikely(time_diff <= 0))
-			time_diff = JIFFIES_TO_NS(1) / 2;
-		else if (unlikely(time_diff > JIFFIES_TO_NS(1)))
-			time_diff = JIFFIES_TO_NS(1);
-
+		niffy_diff(&time_diff, 1);
 		rq->rq_time_slice -= NS_TO_US(time_diff);
 	}
 	rq->rq_last_ran = rq->timekeep_clock = rq->clock;
@@ -2425,10 +2403,10 @@ static void task_running_tick(struct rq *rq)
 			return;
 		else
 			rq->rq_time_slice = 0;
-	} else if (rq->rq_time_slice >= 100)
+	} else if (rq->rq_time_slice >= RESCHED_US)
 			return;
 
-	/* p->time_slice < 100us. We only modify task_struct under grq lock */
+	/* p->time_slice < RESCHED_US. We only modify task_struct under grq lock */
 	p = rq->curr;
 	requeue_task(p);
 	grq_lock();
@@ -2526,17 +2504,17 @@ EXPORT_SYMBOL(sub_preempt_count);
  * proportion works out to the square of the virtual deadline difference, so
  * this equation will give nice 19 3% CPU compared to nice 0.
  */
-static inline int prio_deadline_diff(int user_prio)
+static inline u64 prio_deadline_diff(int user_prio)
 {
 	return (prio_ratios[user_prio] * rr_interval * (MS_TO_NS(1) / 128));
 }
 
-static inline int task_deadline_diff(struct task_struct *p)
+static inline u64 task_deadline_diff(struct task_struct *p)
 {
 	return prio_deadline_diff(TASK_USER_PRIO(p));
 }
 
-static inline int static_deadline_diff(int static_prio)
+static inline u64 static_deadline_diff(int static_prio)
 {
 	return prio_deadline_diff(USER_PRIO(static_prio));
 }
@@ -2550,15 +2528,14 @@ static inline int ms_longest_deadline_diff(void)
  * The time_slice is only refilled when it is empty and that is when we set a
  * new deadline.
  */
-static inline void time_slice_expired(struct task_struct *p)
+static void time_slice_expired(struct task_struct *p)
 {
-	reset_first_time_slice(p);
 	p->time_slice = timeslice();
 	p->deadline = grq.niffies + task_deadline_diff(p);
 }
 
 /*
- * Timeslices below 100us are considered as good as expired as there's no
+ * Timeslices below RESCHED_US are considered as good as expired as there's no
  * point rescheduling when there's so little time left. SCHED_BATCH tasks
  * have been flagged be not latency sensitive and likely to be fully CPU
  * bound so every time they're rescheduled they have their time_slice
@@ -2568,7 +2545,7 @@ static inline void time_slice_expired(struct task_struct *p)
  */
 static inline void check_deadline(struct task_struct *p)
 {
-	if (p->time_slice < 100 || batch_task(p))
+	if (p->time_slice < RESCHED_US || batch_task(p))
 		time_slice_expired(p);
 }
 
@@ -2593,7 +2570,7 @@ static inline void check_deadline(struct task_struct *p)
 static inline struct
 task_struct *earliest_deadline_task(struct rq *rq, struct task_struct *idle)
 {
-	unsigned long dl, earliest_deadline = 0; /* Initialise to silence compiler */
+	u64 dl, earliest_deadline = 0; /* Initialise to silence compiler */
 	struct task_struct *p, *edt = idle;
 	unsigned int cpu = cpu_of(rq);
 	struct list_head *queue;
@@ -2790,6 +2767,7 @@ need_resched_nonpreemptible:
 		 */
 		next = idle;
 		schedstat_inc(rq, sched_goidle);
+		set_cpuidle_map(cpu);
 	} else {
 		next = earliest_deadline_task(rq, idle);
 		prefetch(next);
@@ -4848,7 +4826,6 @@ migration_call(struct notifier_block *nfb, unsigned long action, void *hcpu)
 
 	case CPU_DEAD:
 	case CPU_DEAD_FROZEN:
-		cpuset_lock(); /* around calls to cpuset_cpus_allowed_lock() */
 		idle = rq->idle;
 		/* Idle task back to normal (off runqueue, low prio) */
 		grq_lock_irq();
@@ -4859,7 +4836,6 @@ migration_call(struct notifier_block *nfb, unsigned long action, void *hcpu)
 		set_rq_task(rq, idle);
 		update_clocks(rq);
 		grq_unlock_irq();
-		cpuset_unlock();
 		break;
 
 	case CPU_DYING:
@@ -6518,6 +6494,7 @@ void __init sched_init(void)
 	spin_lock_init(&grq.lock);
 	grq.nr_running = grq.nr_uninterruptible = grq.nr_switches = 0;
 	grq.niffies = 0;
+	grq.last_jiffy = jiffies;
 	spin_lock_init(&grq.iso_lock);
 	grq.iso_ticks = grq.iso_refractory = 0;
 #ifdef CONFIG_SMP
@@ -6822,8 +6799,34 @@ cputime_t task_stime(struct task_struct *p)
 
 /*
  * Must be called with siglock held.
- */// Removed this code for now it will not compile with it included //King
+ */
+void thread_group_times(struct task_struct *p, cputime_t *ut, cputime_t *st)
+{
+	struct signal_struct *sig = p->signal;
+	struct task_cputime cputime;
+	cputime_t rtime, utime, total;
 
+	thread_group_cputime(p, &cputime);
+
+	total = cputime_add(cputime.utime, cputime.stime);
+	rtime = nsecs_to_cputime(cputime.sum_exec_runtime);
+
+	if (total) {
+		u64 temp;
+
+		temp = (u64)(rtime * cputime.utime);
+		do_div(temp, total);
+		utime = (cputime_t)temp;
+	} else
+		utime = rtime;
+
+	sig->prev_utime = max(sig->prev_utime, utime);
+	sig->prev_stime = max(sig->prev_stime,
+			      cputime_sub(rtime, sig->prev_utime));
+
+	*ut = sig->prev_utime;
+	*st = sig->prev_stime;
+}
 #endif
 
 inline cputime_t task_gtime(struct task_struct *p)
